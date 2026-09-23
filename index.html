@@ -1254,7 +1254,7 @@ footer{padding-top:48px;letter-spacing:.16em;font-size:10px}
 
 </style>
 <!-- relationship-layout-v2: grid picker / dialogue-only arrows -->
-<!-- qna-v4: JSONP request bridge / hidden admin hints / verified admin -->
+<!-- qna-v12: form+iframe postMessage bridge / verified admin / hidden admin hints -->
 </head>
 <body>
 
@@ -3117,12 +3117,12 @@ render();
 
 
 // === Q&A / Google Sheets Apps Script ===
-const QNA_EXPECTED_API_VERSION = "10"; // v11 frontend: direct JSONP actions
+const QNA_EXPECTED_API_VERSION = "12"; // v12: hidden form + iframe postMessage bridge
 const QNA_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwRp5PXPojK312DaK2fllKQi0Ec-bqZiYD2m8Isc3xzYkRop0tx0Sxm7La6alvWWbe31Q/exec";
 let qnaItems = [];
 let qnaMasterPassword = sessionStorage.getItem("dlh_qna_master") || "";
 let qnaAction = {type:"ask", item:null};
-let qnaJsonpSeq = 0;
+let qnaBridgeSeq = 0;
 
 const qnaOverlay = document.getElementById("qnaOverlay");
 const qnaLog = document.getElementById("qnaLog");
@@ -3145,7 +3145,7 @@ function qnaEscapeTime(value){
 }
 function qnaShowToast(msg){
   qnaToast.textContent=msg; qnaToast.classList.add("show");
-  clearTimeout(qnaShowToast.t); qnaShowToast.t=setTimeout(()=>qnaToast.classList.remove("show"),1900);
+  clearTimeout(qnaShowToast.t); qnaShowToast.t=setTimeout(()=>qnaToast.classList.remove("show"),2400);
 }
 function qnaResetAction(){
   qnaAction={type:qnaIsMaster()?"idle":"ask",item:null};
@@ -3193,65 +3193,48 @@ window.openQna=openQna;
 qnaClose.addEventListener("click",closeQna);
 qnaOverlay.addEventListener("click",e=>{if(e.target===qnaOverlay) closeQna();});
 
-function qnaJsonpRequest(params){
+// v12 통신: fetch/JSONP 없이 일반 HTML form을 Google Apps Script로 POST하고,
+// 숨겨진 iframe에 표시된 응답 페이지가 postMessage로 결과를 돌려준다.
+// CORS 영향을 받지 않고 비밀번호도 URL에 노출되지 않는다.
+function qnaBridgeRequest(params){
   return new Promise((resolve,reject)=>{
-    const callbackName="_dlhQnaCb_"+Date.now()+"_"+(++qnaJsonpSeq)+"_"+Math.random().toString(36).slice(2,8);
-    const script=document.createElement("script");
-    const url=new URL(QNA_WEB_APP_URL);
-    Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,String(v)));
-    url.searchParams.set("callback",callbackName);
-    url.searchParams.set("_t",String(Date.now()));
-    let timer;
+    if(!qnaConnected()){ reject(new Error("QNA_NOT_CONNECTED")); return; }
+    const requestId="dlh_"+Date.now()+"_"+(++qnaBridgeSeq)+"_"+Math.random().toString(36).slice(2,10);
+    const frameName="dlhQnaFrame_"+Date.now()+"_"+qnaBridgeSeq;
+    const iframe=document.createElement("iframe");
+    iframe.name=frameName; iframe.setAttribute("aria-hidden","true");
+    iframe.style.cssText="position:fixed;width:1px;height:1px;left:-9999px;top:-9999px;border:0;opacity:0;pointer-events:none";
+    const form=document.createElement("form");
+    form.method="POST"; form.action=QNA_WEB_APP_URL; form.target=frameName;
+    form.acceptCharset="UTF-8"; form.style.display="none";
+
+    const all={...params,bridge:"1",requestId};
+    Object.entries(all).forEach(([key,val])=>{
+      const input=document.createElement("input");
+      input.type="hidden"; input.name=key; input.value=String(val==null?"":val); form.appendChild(input);
+    });
+
+    let done=false;
     const cleanup=()=>{
-      clearTimeout(timer);
-      try{delete window[callbackName];}catch(_){window[callbackName]=undefined;}
-      script.remove();
+      if(done) return; done=true;
+      clearTimeout(timer); window.removeEventListener("message",onMessage);
+      setTimeout(()=>{try{form.remove();iframe.remove();}catch(_){}},0);
     };
-    window[callbackName]=(data)=>{cleanup();resolve(data);};
-    script.onerror=()=>{cleanup();reject(new Error("QNA_JSONP_ERROR"));};
-    timer=setTimeout(()=>{cleanup();reject(new Error("QNA_JSONP_TIMEOUT"));},15000);
-    script.src=url.toString();
-    document.head.appendChild(script);
+    const onMessage=(event)=>{
+      const data=event.data;
+      if(!data || data.type!=="DLH_QNA_BRIDGE" || data.requestId!==requestId) return;
+      cleanup(); resolve(data.result || {ok:false,error:"처리 결과가 없습니다."});
+    };
+    window.addEventListener("message",onMessage);
+    const timer=setTimeout(()=>{cleanup();reject(new Error("QNA_BRIDGE_TIMEOUT"));},20000);
+    document.body.appendChild(iframe); document.body.appendChild(form);
+    try{ form.submit(); }
+    catch(err){ cleanup(); reject(err); }
   });
 }
 
-async function qnaPostAndPoll(params){
-  const requestId="dlh_qna_"+Date.now()+"_"+(++qnaJsonpSeq)+"_"+Math.random().toString(36).slice(2,10);
-  const body=new URLSearchParams();
-  Object.entries({...params,requestId}).forEach(([k,v])=>body.set(k,String(v == null ? "" : v)));
-
-  try{
-    await fetch(QNA_WEB_APP_URL,{
-      method:"POST",
-      mode:"no-cors",
-      cache:"no-store",
-      credentials:"omit",
-      body
-    });
-  }catch(err){
-    console.warn("Q&A POST 전송 오류",err);
-  }
-
-  const started=Date.now();
-  while(Date.now()-started<18000){
-    try{
-      const status=await qnaJsonpRequest({action:"requestStatus",requestId});
-      if(status?.ok && status.pending===false){
-        return status.result || {ok:false,error:"처리 결과가 없습니다."};
-      }
-    }catch(err){
-      console.warn("Q&A 상태 확인 오류",err);
-    }
-    await new Promise(r=>setTimeout(r,350));
-  }
-  throw new Error("QNA_POST_TIMEOUT");
-}
-
 async function qnaRequest(data){
-  // Apps Script ContentService는 GitHub Pages의 일반 fetch POST 응답을
-  // 안정적으로 읽기 어렵기 때문에, 서버가 이미 지원하는 JSONP GET을
-  // 질문/답변/수정/삭제에도 동일하게 사용한다.
-  const res=await qnaJsonpRequest(data);
+  const res=await qnaBridgeRequest(data);
   if(!res?.ok) throw new Error(res?.error||"Q&A 요청에 실패했습니다.");
   if(res.action && data.action && String(res.action)!==String(data.action)) throw new Error("SERVER_ACTION_MISMATCH");
   return res;
@@ -3260,9 +3243,7 @@ async function qnaRequest(data){
 async function qnaLoad(scrollMode="keep"){
   const previousScroll=qnaLog.scrollTop;
   try{
-    const res=await qnaJsonpRequest({action:"list"});
-    if(!res?.ok) throw new Error(res?.error||"목록을 불러오지 못했습니다.");
-    if(res.action && String(res.action)!=="list") throw new Error("SERVER_ACTION_MISMATCH");
+    const res=await qnaRequest({action:"list"});
     qnaItems=Array.isArray(res.items)?res.items:[];
     qnaRender();
     requestAnimationFrame(()=>{
@@ -3272,7 +3253,7 @@ async function qnaLoad(scrollMode="keep"){
     });
   }catch(err){
     console.error("Q&A 불러오기 오류",err);
-    qnaShowToast("Q&A를 불러오지 못했습니다. 잠시 후 다시 열어주세요.");
+    qnaShowToast(String(err?.message||"").includes("TIMEOUT")?"Q&A 서버 응답이 늦습니다. 잠시 후 다시 열어주세요.":"Q&A를 불러오지 못했습니다.");
   }
 }
 function qnaMakeAdminButton(label, onClick, danger=false){
@@ -3286,8 +3267,6 @@ function qnaRender(){
   }
   qnaItems.forEach(item=>{
     const itemEl=document.createElement("div"); itemEl.className="qna-item";
-
-    // 질문자: 오른쪽
     const askRow=document.createElement("div"); askRow.className="qna-row ask";
     const av=document.createElement("div"); av.className="qna-avatar"; av.textContent=qnaDisplayName(item)==="익명"?"익명":qnaDisplayName(item).slice(0,2);
     const askWrap=document.createElement("div"); askWrap.className="qna-msg-wrap";
@@ -3296,7 +3275,6 @@ function qnaRender(){
     const askTime=document.createElement("div"); askTime.className="qna-time"; askTime.textContent=qnaEscapeTime(item.askedAt);
     askWrap.append(askName,askBubble,askTime); askRow.append(askWrap,av); itemEl.append(askRow);
 
-    // 답변자 미어캣: 왼쪽
     if(item.answer){
       const ansRow=document.createElement("div"); ansRow.className="qna-row answer";
       const ansAv=document.createElement("div"); ansAv.className="qna-avatar"; ansAv.textContent="M";
@@ -3332,30 +3310,44 @@ function qnaChooseEditAnswer(item){
 }
 async function qnaDeleteQuestion(item){
   if(!qnaIsMaster()||!window.confirm("이 질문과 답변을 모두 삭제할까요?")) return;
-  qnaSend.disabled=true; try{await qnaRequest({action:"deleteQuestion",id:item.id,password:qnaMasterPassword}); await new Promise(r=>setTimeout(r,250)); await qnaLoad("keep"); qnaShowToast("질문을 삭제했습니다.");}
-  catch(e){const m=String(e?.message||""); if(m.includes("비밀번호가 틀렸습니다")){qnaLogout(); qnaShowToast("관리자 비밀번호가 맞지 않습니다.");} else qnaShowToast("삭제에 실패했습니다.");} finally{qnaSend.disabled=false;}
+  qnaSend.disabled=true;
+  try{ await qnaRequest({action:"deleteQuestion",id:item.id,password:qnaMasterPassword}); await qnaLoad("keep"); qnaShowToast("질문을 삭제했습니다."); }
+  catch(e){ qnaHandleAdminError(e,"삭제에 실패했습니다."); }
+  finally{qnaSend.disabled=false;}
 }
 async function qnaDeleteAnswer(item){
   if(!qnaIsMaster()||!window.confirm("미어캣 답변만 삭제할까요?")) return;
-  qnaSend.disabled=true; try{await qnaRequest({action:"deleteAnswer",id:item.id,password:qnaMasterPassword}); await new Promise(r=>setTimeout(r,250)); await qnaLoad("keep"); qnaShowToast("답변을 삭제했습니다.");}
-  catch(e){const m=String(e?.message||""); if(m.includes("비밀번호가 틀렸습니다")){qnaLogout(); qnaShowToast("관리자 비밀번호가 맞지 않습니다.");} else qnaShowToast("삭제에 실패했습니다.");} finally{qnaSend.disabled=false;}
+  qnaSend.disabled=true;
+  try{ await qnaRequest({action:"deleteAnswer",id:item.id,password:qnaMasterPassword}); await qnaLoad("keep"); qnaShowToast("답변을 삭제했습니다."); }
+  catch(e){ qnaHandleAdminError(e,"삭제에 실패했습니다."); }
+  finally{qnaSend.disabled=false;}
+}
+function qnaHandleAdminError(err,fallback){
+  console.error("Q&A 관리자 작업 오류",err);
+  const msg=String(err?.message||"");
+  if(msg.includes("비밀번호가 틀렸습니다") || msg.includes("아직 설정되지 않았습니다")){
+    qnaMasterPassword=""; sessionStorage.removeItem("dlh_qna_master"); qnaAction={type:"ask",item:null}; qnaSyncMasterUI(); qnaRender();
+    qnaShowToast(msg.includes("틀렸습니다")?"관리자 비밀번호가 맞지 않습니다.":"관리자 비밀번호 설정을 확인해 주세요.");
+  }else qnaShowToast(fallback);
 }
 async function qnaEnterMaster(){
   const pw=window.prompt("관리자 비밀번호를 입력하세요.");
   if(pw===null) return;
   const cleanPw=String(pw).trim().normalize("NFKC");
   if(!cleanPw){qnaShowToast("비밀번호를 입력해 주세요.");return;}
-
-  // 관리자 UI를 여는 것 자체는 보안 경계가 아니다.
-  // 실제 답변/수정/삭제 시 Apps Script가 비밀번호를 다시 검사한다.
-  // 따라서 브라우저의 교차 출처 인증 응답 문제 때문에 UI가 막히지 않도록
-  // 여기서는 입력값을 세션에 보관하고 즉시 관리 화면을 연다.
-  qnaMasterPassword=cleanPw;
-  sessionStorage.setItem("dlh_qna_master",cleanPw);
-  qnaAction={type:"idle",item:null};
-  qnaSyncMasterUI();
-  qnaRender();
-  qnaShowToast("관리 모드가 열렸습니다.");
+  qnaSend.disabled=true;
+  try{
+    const res=await qnaRequest({action:"verify",password:cleanPw});
+    if(res.authorized!==true) throw new Error("관리자 인증에 실패했습니다.");
+    qnaMasterPassword=cleanPw; sessionStorage.setItem("dlh_qna_master",cleanPw);
+    qnaAction={type:"idle",item:null}; qnaSyncMasterUI(); qnaRender(); qnaShowToast("관리 모드가 열렸습니다.");
+  }catch(err){
+    qnaMasterPassword=""; sessionStorage.removeItem("dlh_qna_master");
+    const msg=String(err?.message||"");
+    if(msg.includes("비밀번호가 틀렸습니다")) qnaShowToast("관리자 비밀번호가 맞지 않습니다.");
+    else if(msg.includes("아직 설정되지 않았습니다")) qnaShowToast("QNA_CONFIG의 비밀번호 설정을 확인해 주세요.");
+    else {console.error("Q&A 관리자 인증 오류",err); qnaShowToast("관리자 인증 요청을 처리하지 못했습니다.");}
+  } finally { qnaSend.disabled=false; }
 }
 function qnaLogout(){
   qnaMasterPassword=""; sessionStorage.removeItem("dlh_qna_master"); qnaAction={type:"ask",item:null}; qnaSelected.classList.remove("show"); qnaSelected.textContent=""; qnaOverlay.classList.remove("edit-question");
@@ -3372,11 +3364,9 @@ async function qnaSubmit(){
       if(value.length>500){qnaShowToast("질문은 500자 이하로 써주세요.");return;}
       const nickname=qnaNickname.value.trim(); if(nickname.length>20){qnaShowToast("닉네임은 20자 이하로 써주세요.");return;}
       const last=Number(localStorage.getItem("dlh_qna_last")||0); if(Date.now()-last<5000){qnaShowToast("잠시 후 다시 보내주세요.");return;}
-      await qnaRequest({action:"ask",question:value,nickname}); localStorage.setItem("dlh_qna_last",String(Date.now())); qnaInput.value=""; qnaNickname.value="";
-      await new Promise(r=>setTimeout(r,200)); await qnaLoad("bottom");
-      const reflected=qnaItems.some(x=>String(x.question||"")===value && String(x.nickname||"")===nickname);
-      if(!reflected){ await new Promise(r=>setTimeout(r,350)); await qnaLoad("bottom"); }
-      qnaShowToast(nickname?`${nickname} 닉네임으로 질문을 보냈습니다.`:"익명 질문을 보냈습니다.");
+      await qnaRequest({action:"ask",question:value,nickname});
+      localStorage.setItem("dlh_qna_last",String(Date.now())); qnaInput.value=""; qnaNickname.value="";
+      await qnaLoad("bottom"); qnaShowToast(nickname?`${nickname} 닉네임으로 질문을 보냈습니다.`:"익명 질문을 보냈습니다.");
     }else{
       const item=qnaAction.item; if(!item){qnaShowToast("먼저 관리할 질문을 선택해 주세요.");return;}
       if(qnaAction.type==="answer"){
@@ -3390,23 +3380,12 @@ async function qnaSubmit(){
         if(value.length>1000){qnaShowToast("답변은 1000자 이하로 써주세요.");return;}
         await qnaRequest({action:"editAnswer",id:item.id,answer:value,password:qnaMasterPassword});
       }else {qnaShowToast("관리 작업을 선택해 주세요.");return;}
-      await new Promise(r=>setTimeout(r,250)); await qnaLoad("keep"); qnaResetAction(); qnaShowToast("저장했습니다.");
+      await qnaLoad("keep"); qnaResetAction(); qnaShowToast("저장했습니다.");
     }
   }catch(err){
-    console.error("Q&A 저장 오류",err);
-    const msg=String(err?.message||"");
-    if(msg.includes("비밀번호가 틀렸습니다") || msg.includes("아직 설정되지 않았습니다")){
-      qnaMasterPassword="";
-      sessionStorage.removeItem("dlh_qna_master");
-      qnaAction={type:"ask",item:null};
-      qnaSyncMasterUI();
-      qnaRender();
-      qnaShowToast(msg.includes("틀렸습니다")?"관리자 비밀번호가 맞지 않습니다.":"관리자 비밀번호 설정을 확인해 주세요.");
-    }else{
-      qnaShowToast("저장에 실패했습니다. 잠시 후 다시 시도해 주세요.");
-    }
-  }
-  finally{qnaSend.disabled=false;}
+    if(qnaIsMaster()) qnaHandleAdminError(err,"저장에 실패했습니다.");
+    else {console.error("Q&A 저장 오류",err); qnaShowToast("저장에 실패했습니다. 잠시 후 다시 시도해 주세요.");}
+  } finally { qnaSend.disabled=false; }
 }
 qnaSend.addEventListener("click",qnaSubmit);
 qnaInput.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();qnaSubmit();}});
