@@ -3117,7 +3117,7 @@ render();
 
 
 // === Q&A / Google Sheets Apps Script ===
-const QNA_EXPECTED_API_VERSION = "10";
+const QNA_EXPECTED_API_VERSION = "10"; // v11 frontend: direct JSONP actions
 const QNA_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwRp5PXPojK312DaK2fllKQi0Ec-bqZiYD2m8Isc3xzYkRop0tx0Sxm7La6alvWWbe31Q/exec";
 let qnaItems = [];
 let qnaMasterPassword = sessionStorage.getItem("dlh_qna_master") || "";
@@ -3248,7 +3248,10 @@ async function qnaPostAndPoll(params){
 }
 
 async function qnaRequest(data){
-  const res=await qnaPostAndPoll(data);
+  // Apps Script ContentService는 GitHub Pages의 일반 fetch POST 응답을
+  // 안정적으로 읽기 어렵기 때문에, 서버가 이미 지원하는 JSONP GET을
+  // 질문/답변/수정/삭제에도 동일하게 사용한다.
+  const res=await qnaJsonpRequest(data);
   if(!res?.ok) throw new Error(res?.error||"Q&A 요청에 실패했습니다.");
   if(res.action && data.action && String(res.action)!==String(data.action)) throw new Error("SERVER_ACTION_MISMATCH");
   return res;
@@ -3330,38 +3333,29 @@ function qnaChooseEditAnswer(item){
 async function qnaDeleteQuestion(item){
   if(!qnaIsMaster()||!window.confirm("이 질문과 답변을 모두 삭제할까요?")) return;
   qnaSend.disabled=true; try{await qnaRequest({action:"deleteQuestion",id:item.id,password:qnaMasterPassword}); await new Promise(r=>setTimeout(r,250)); await qnaLoad("keep"); qnaShowToast("질문을 삭제했습니다.");}
-  catch(e){qnaShowToast("삭제에 실패했습니다.");} finally{qnaSend.disabled=false;}
+  catch(e){const m=String(e?.message||""); if(m.includes("비밀번호가 틀렸습니다")){qnaLogout(); qnaShowToast("관리자 비밀번호가 맞지 않습니다.");} else qnaShowToast("삭제에 실패했습니다.");} finally{qnaSend.disabled=false;}
 }
 async function qnaDeleteAnswer(item){
   if(!qnaIsMaster()||!window.confirm("미어캣 답변만 삭제할까요?")) return;
   qnaSend.disabled=true; try{await qnaRequest({action:"deleteAnswer",id:item.id,password:qnaMasterPassword}); await new Promise(r=>setTimeout(r,250)); await qnaLoad("keep"); qnaShowToast("답변을 삭제했습니다.");}
-  catch(e){qnaShowToast("삭제에 실패했습니다.");} finally{qnaSend.disabled=false;}
+  catch(e){const m=String(e?.message||""); if(m.includes("비밀번호가 틀렸습니다")){qnaLogout(); qnaShowToast("관리자 비밀번호가 맞지 않습니다.");} else qnaShowToast("삭제에 실패했습니다.");} finally{qnaSend.disabled=false;}
 }
 async function qnaEnterMaster(){
   const pw=window.prompt("관리자 비밀번호를 입력하세요.");
   if(pw===null) return;
   const cleanPw=String(pw).trim().normalize("NFKC");
   if(!cleanPw){qnaShowToast("비밀번호를 입력해 주세요.");return;}
-  try{
-    const res=await qnaRequest({action:"verify",password:cleanPw});
-    if(!res?.ok) throw new Error(res?.error||"VERIFY_FAILED");
-    if(String(res.action||"")!=="verify" || res.authorized!==true){
-      throw new Error("SERVER_ACTION_MISMATCH");
-    }
-    qnaMasterPassword=cleanPw;
-    sessionStorage.setItem("dlh_qna_master",cleanPw);
-    qnaAction={type:"idle",item:null};
-    qnaSyncMasterUI(); qnaRender();
-    qnaShowToast("관리 모드가 열렸습니다.");
-  }catch(err){
-    qnaMasterPassword="";
-    sessionStorage.removeItem("dlh_qna_master");
-    const msg=String(err?.message||"");
-    if(msg.includes("아직 설정되지 않았습니다")) qnaShowToast("QNA_CONFIG 시트 B1에 관리자 비밀번호를 입력해 주세요.");
-    else if(msg.includes("비밀번호가 틀렸습니다")) qnaShowToast("관리자 비밀번호가 맞지 않습니다.");
-    else if(msg.includes("QNA_POST_TIMEOUT")) {console.error("Q&A 관리자 인증 오류",err); qnaShowToast("관리자 인증 서버가 응답하지 않습니다. Apps Script 최신 배포를 확인해 주세요.");}
-    else {console.error("Q&A 관리자 인증 오류",err); qnaShowToast("관리자 인증 요청을 처리하지 못했습니다.");}
-  }
+
+  // 관리자 UI를 여는 것 자체는 보안 경계가 아니다.
+  // 실제 답변/수정/삭제 시 Apps Script가 비밀번호를 다시 검사한다.
+  // 따라서 브라우저의 교차 출처 인증 응답 문제 때문에 UI가 막히지 않도록
+  // 여기서는 입력값을 세션에 보관하고 즉시 관리 화면을 연다.
+  qnaMasterPassword=cleanPw;
+  sessionStorage.setItem("dlh_qna_master",cleanPw);
+  qnaAction={type:"idle",item:null};
+  qnaSyncMasterUI();
+  qnaRender();
+  qnaShowToast("관리 모드가 열렸습니다.");
 }
 function qnaLogout(){
   qnaMasterPassword=""; sessionStorage.removeItem("dlh_qna_master"); qnaAction={type:"ask",item:null}; qnaSelected.classList.remove("show"); qnaSelected.textContent=""; qnaOverlay.classList.remove("edit-question");
@@ -3398,7 +3392,20 @@ async function qnaSubmit(){
       }else {qnaShowToast("관리 작업을 선택해 주세요.");return;}
       await new Promise(r=>setTimeout(r,250)); await qnaLoad("keep"); qnaResetAction(); qnaShowToast("저장했습니다.");
     }
-  }catch(err){console.error("Q&A 저장 오류",err);qnaShowToast("저장에 실패했습니다. 잠시 후 다시 시도해 주세요.");}
+  }catch(err){
+    console.error("Q&A 저장 오류",err);
+    const msg=String(err?.message||"");
+    if(msg.includes("비밀번호가 틀렸습니다") || msg.includes("아직 설정되지 않았습니다")){
+      qnaMasterPassword="";
+      sessionStorage.removeItem("dlh_qna_master");
+      qnaAction={type:"ask",item:null};
+      qnaSyncMasterUI();
+      qnaRender();
+      qnaShowToast(msg.includes("틀렸습니다")?"관리자 비밀번호가 맞지 않습니다.":"관리자 비밀번호 설정을 확인해 주세요.");
+    }else{
+      qnaShowToast("저장에 실패했습니다. 잠시 후 다시 시도해 주세요.");
+    }
+  }
   finally{qnaSend.disabled=false;}
 }
 qnaSend.addEventListener("click",qnaSubmit);
